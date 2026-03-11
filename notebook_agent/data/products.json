@@ -1,0 +1,50 @@
+[
+  {
+    "product_id": "laptop_001",
+    "name": "华硕无畏 Pro 15 2024",
+    "brand": "华硕",
+    "price": 6999,
+    "cpu_model": "Ultra 5 125H",
+    "gpu_model": "RTX 4050 Laptop",
+    "memory_gb": 16,
+    "storage_gb": 1024,
+    "weight_kg": 1.8,
+    "battery_hours": 8.5
+  },
+  {
+    "product_id": "laptop_002",
+    "name": "惠普战 66 六代",
+    "brand": "惠普",
+    "price": 5299,
+    "cpu_model": "R7 7840U",
+    "gpu_model": "核显",
+    "memory_gb": 16,
+    "storage_gb": 512,
+    "weight_kg": 1.49,
+    "battery_hours": 10.0
+  },
+  {
+    "product_id": "laptop_003",
+    "name": "机械革命极光 X",
+    "brand": "机械革命",
+    "price": 6499,
+    "cpu_model": "i7-13650HX",
+    "gpu_model": "RTX 4060 Laptop",
+    "memory_gb": 16,
+    "storage_gb": 1024,
+    "weight_kg": 2.3,
+    "battery_hours": 5.0
+  },
+  {
+    "product_id": "laptop_004",
+    "name": "联想小新 Pro 14",
+    "brand": "联想",
+    "price": 6199,
+    "cpu_model": "R7 8845HS",
+    "gpu_model": "核显",
+    "memory_gb": 32,
+    "storage_gb": 1024,
+    "weight_kg": 1.46,
+    "battery_hours": 9.0
+  }
+]
