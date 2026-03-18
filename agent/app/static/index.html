@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>商品选购助手</title>
+  <link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="sidebar-header">
+      <button class="btn-new-chat" id="new-chat-btn">
+        <span>+</span>
+        <span>新对话</span>
+      </button>
+    </div>
+    <div class="sidebar-body" id="sidebar-body"></div>
+  </aside>
+  <main class="main">
+    <div class="messages-container" id="messages-container"></div>
+    <div class="empty-state" id="empty-state">
+      <h2>商品选购助手</h2>
+      <p>请填写必填项（品类、预算上限、使用场景），可选补充偏好后提交推荐。</p>
+    </div>
+    <div class="input-area">
+      <form class="form-wrapper" id="query-form">
+        <div class="form-grid">
+          <label class="field">
+            <span>品类（必填）</span>
+            <input id="keyword-input" type="text" placeholder="例如：笔记本" required>
+          </label>
+          <label class="field">
+            <span>预算上限（元，必填）</span>
+            <input id="budget-max-input" type="number" min="1" step="1" placeholder="例如：5000" required>
+          </label>
+          <label class="field field-full">
+            <span>使用场景（必填）</span>
+            <input id="usage-input" type="text" placeholder="例如：日常办公、轻度编程" required>
+          </label>
+          <label class="field">
+            <span>预算下限（可选）</span>
+            <input id="budget-min-input" type="number" min="1" step="1" placeholder="例如：4000">
+          </label>
+          <label class="field">
+            <span>品牌偏好（可选）</span>
+            <input id="brand-pref-input" type="text" placeholder="例如：联想、华为">
+          </label>
+          <label class="field">
+            <span>排除品牌（可选）</span>
+            <input id="brand-avoid-input" type="text" placeholder="例如：某品牌">
+          </label>
+          <label class="field">
+            <span>便携需求（可选）</span>
+            <select id="portability-input">
+              <option value="">未指定</option>
+              <option value="true">是</option>
+              <option value="false">否</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>独显需求（可选）</span>
+            <select id="gpu-input">
+              <option value="">未指定</option>
+              <option value="true">是</option>
+              <option value="false">否</option>
+            </select>
+          </label>
+          <label class="field field-full">
+            <span>其他补充（可选）</span>
+            <input id="extra-input" type="text" placeholder="例如：16G 内存、512G SSD、轻薄">
+          </label>
+        </div>
+        <div class="form-actions">
+          <button class="btn-send" id="send-btn" type="submit">提交需求</button>
+        </div>
+      </form>
+    </div>
+  </main>
+  <script src="/static/chat.js"></script>
+</body>
+</html>
