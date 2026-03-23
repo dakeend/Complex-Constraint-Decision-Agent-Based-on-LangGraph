@@ -6,14 +6,14 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
-from langchain_tavily import TavilySearch
 from .state import AgentState
 from .services.content_search import search_public_content
 from .services.evidence import extract_evidence, deduplicate_candidates
 from .services.pdd_client import (
-    search_goods,
     map_candidates_to_pdd,
     get_promotion_links,
+    find_pdd_match_for_candidate,
+    search_approximate_goods,
 )
 from .services.preferences import recall_preferences, rewrite_query
 from .services.quality_evaluation import (
@@ -29,12 +29,19 @@ from .services.quality_evaluation import (
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "products.json"
 os.environ.setdefault("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY", ""))
-model = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    api_key=os.environ["GROQ_API_KEY"],
-)
-search_tool=TavilySearch(result=5)
-tools=[search_tool]
+_llm: ChatGroq | None = None
+
+
+def _get_llm() -> ChatGroq:
+    """惰性初始化 Groq LLM，避免 import 阶段因缺少环境变量直接崩溃。"""
+    global _llm
+    if _llm is not None:
+        return _llm
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("缺少 GROQ_API_KEY 环境变量，无法调用 Groq LLM。")
+    _llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key)
+    return _llm
 
 class RequirementCheckResult(BaseModel):
     """总控 Agent：需求充分性判断的结构化输出"""
@@ -51,7 +58,22 @@ class RequirementCheckResult(BaseModel):
 class WebSearchResult(BaseModel):
     """LLM 根据搜索结果整合后的输出"""
     source_from: str = Field(description="搜索来源，如知乎、小红书")
-    search_result: str = Field(description="对搜索结果进行整合，推荐前五的商品或结论")
+    search_result: str = Field(
+        description="对搜索结果整合，推荐前五的商品。每个商品必须包含：1) 商品名称 2) 推荐原因（一句话说明为何推荐，如配置、性价比、口碑等）"
+    )
+
+
+class ProductWithReason(BaseModel):
+    """单个推荐商品及其推荐原因"""
+    product_name: str = Field(description="商品名称或型号")
+    reason: str = Field(description="推荐原因，一句话说明为何推荐")
+
+
+class LlmRecommendationsResult(BaseModel):
+    """LLM 从平台摘要中解析出的推荐商品列表（含推荐原因）"""
+    recommendations: list[ProductWithReason] = Field(
+        description="按推荐顺序排列的推荐列表，每项包含商品名称和推荐原因，最多5个"
+    )
 
 
 class ParsedConstraintsResult(BaseModel):
@@ -66,11 +88,20 @@ class ParsedConstraintsResult(BaseModel):
     keyword: str = Field(default="笔记本", description="商品关键词/品类")
 
 
-# 总控 Agent 专用：不绑定工具，只做充分性判断 + 需求加工
-orchestrator_llm = model.with_structured_output(RequirementCheckResult)
-# 仅用于「先搜再答」：根据搜索结果文本做整合，不绑定 search tool
-web_search_summary_llm = model.with_structured_output(WebSearchResult)
-constraint_parser_llm = model.with_structured_output(ParsedConstraintsResult)
+def _orchestrator_llm():
+    return _get_llm().with_structured_output(RequirementCheckResult)
+
+
+def _web_search_summary_llm():
+    return _get_llm().with_structured_output(WebSearchResult)
+
+
+def _constraint_parser_llm():
+    return _get_llm().with_structured_output(ParsedConstraintsResult)
+
+
+def _llm_recommendations_parser_llm():
+    return _get_llm().with_structured_output(LlmRecommendationsResult)
 
 
 ORCHESTRATOR_PROMPT = """你是一个商品推荐流程的总控 Agent。
@@ -132,7 +163,7 @@ def controlbot(state: AgentState) -> AgentState:
     history_text = "\n".join(history_text_lines) or "（无历史对话，当前为第一轮）"
 
     prompt = ORCHESTRATOR_PROMPT.format(history=history_text, query=query)
-    result = orchestrator_llm.invoke(prompt)
+    result = _orchestrator_llm().invoke(prompt)
 
     return {
         "info_sufficient": result.sufficient,
@@ -157,6 +188,8 @@ def _web_search_agent_impl(
     raw_results = search_public_content(query, platform=platform_key)
     search_list = raw_results[:10]
 
+    # 过滤掉只有摘要没有主要内容的条目，避免上下文混乱
+    search_list = _filter_content_with_body(search_list)
     search_text = "\n\n".join(
         f"[{i+1}] {r.get('title', '')}\n{r.get('snippet', '')}"
         for i, r in enumerate(search_list)
@@ -168,14 +201,91 @@ def _web_search_agent_impl(
     搜索结果：
     {search_text or '（暂无结果）'}
 
-    请填写 source_from 为「{platform_label}」，在 search_result 中写出整合后的推荐结论（前五名或主要推荐）。"""
-    summary = web_search_summary_llm.invoke(prompt)
+    请填写 source_from 为「{platform_label}」，在 search_result 中写出整合后的推荐结论。
+    要求：每个推荐必须同时包含「商品名称」和「推荐原因」（一句话说明为何推荐，如配置、性价比、口碑等），格式示例：
+    1. 机械革命极光X：同价位性价比高，RTX4060 满功耗释放，适合游戏
+    2. 联想拯救者R7000P：一线品牌售后好，性能释放稳定"""
+    summary = _web_search_summary_llm().invoke(prompt)
 
     return {
         "content_search_results": search_list,
-        "web_search_summary": summary.search_result,
-        "web_search_source": summary.source_from,
+        # 每个平台节点都产出一份并行压缩摘要，供汇总节点统一评价
+        "platform_summaries": [
+            {
+                "platform": platform_key,
+                "source_from": summary.source_from,
+                "summary": summary.search_result,
+            }
+        ],
     }
+
+
+def summarize_public_search(state: AgentState) -> AgentState:
+    """汇总节点：将各平台节点的压缩结果汇总后，统一做最终评价/结论。"""
+    query = _get_working_query(state)
+    summaries = state.get("platform_summaries") or []
+    # 控制 prompt 大小：每个平台摘要最多截断 1200 字符
+    merged = "\n\n".join(
+        f"【{s.get('source_from') or s.get('platform') or '未知平台'}】\n{(s.get('summary') or '')[:1200]}"
+        for s in summaries
+        if (s.get("summary") or "").strip()
+    )
+    prompt = f"""你是商品推荐流程的“跨平台评价”专家。
+
+用户需求：{query}
+
+以下是多个平台搜索节点分别对各自搜索结果做的并行压缩摘要：
+{merged or '（暂无平台摘要）'}
+
+请综合这些平台摘要，输出最终“推荐前五”或主要结论，并说明共识点与分歧点（如有）。
+要求：
+1) 每个推荐必须同时包含「商品名称」和「推荐原因」（一句话说明为何推荐）
+2) 每个商品/结论 100 字以内，格式示例：机械革命极光X：同价位性价比高，RTX4060 满功耗
+3) 若平台结论矛盾，优先选择证据更充分/更一致的观点
+4) 只输出结论，不要输出推理过程
+
+请填写 source_from 为「综合评价」，在 search_result 中写出最终结论。"""
+    final = _web_search_summary_llm().invoke(prompt)
+    return {"web_search_summary": final.search_result, "web_search_source": final.source_from}
+
+
+def extract_llm_recommendations(state: AgentState) -> AgentState:
+    """
+    从 web_search_summary 和 platform_summaries 中解析 LLM 推荐的商品名称列表（按推荐顺序）。
+    作为主推荐依据，供后续 PDD 映射和最终输出使用。
+    """
+    web_summary = state.get("web_search_summary", "") or ""
+    summaries = state.get("platform_summaries") or []
+    merged = web_summary
+    if summaries:
+        platform_text = "\n".join(
+            f"【{s.get('source_from', s.get('platform', ''))}】{s.get('summary', '')[:800]}"
+            for s in summaries[:6]
+        )
+        merged = f"综合评价：{web_summary}\n\n各平台摘要：\n{platform_text}"
+
+    if not merged.strip():
+        return {"llm_recommended_products": []}
+
+    prompt = f"""你是一个商品推荐解析器。从以下「跨平台综合评价」和各平台摘要中，提取出被推荐的商品/型号及其推荐原因，按推荐优先级排序，最多5个。
+
+内容：
+{merged[:3000]}
+
+对每个推荐输出：商品名称（如机械革命极光X、联想小新Pro14等）和推荐原因（一句话说明为何推荐，如配置、性价比、口碑等）。
+若无法识别具体型号，可输出品牌+品类（如机械革命游戏本）。
+若原文未给出原因，可根据内容推断简要原因。"""
+    try:
+        parsed = _llm_recommendations_parser_llm().invoke(prompt)
+        recs = (parsed.recommendations or [])[:5]
+        products = [r.product_name for r in recs]
+        with_reasons = [{"name": r.product_name, "reason": r.reason or ""} for r in recs]
+        return {
+            "llm_recommended_products": products,
+            "llm_recommended_with_reasons": with_reasons,
+        }
+    except Exception:
+        return {"llm_recommended_products": [], "llm_recommended_with_reasons": []}
 
 
 def web_search_agent_zhihu(state: AgentState) -> AgentState:
@@ -186,7 +296,7 @@ def web_search_agent_zhihu(state: AgentState) -> AgentState:
         state,
         platform_key="zhihu",
         platform_label="知乎",
-        prompt_instruction="根据以下知乎搜索结果，整合并给出「推荐前五」的商品或结论（与用户需求相关），字符长度每个商品限定在100字。",
+        prompt_instruction="根据以下知乎搜索结果，整合并给出「推荐前五」的商品（与用户需求相关）。每个推荐必须包含商品名称和推荐原因（一句话），字符长度每个商品限定在100字。",
     )
 
 
@@ -198,7 +308,7 @@ def web_search_agent_xiaohongshu(state: AgentState) -> AgentState:
         state,
         platform_key="xiaohongshu",
         platform_label="小红书",
-        prompt_instruction="根据以下小红书搜索结果，整合并给出「推荐前五」的商品或结论（与用户需求相关），字符长度每个商品限定在100字。",
+        prompt_instruction="根据以下小红书搜索结果，整合并给出「推荐前五」的商品（与用户需求相关）。每个推荐必须包含商品名称和推荐原因（一句话），字符长度每个商品限定在100字。",
     )
 
 
@@ -210,7 +320,7 @@ def web_search_agent_tieba(state: AgentState) -> AgentState:
         state,
         platform_key="tieba",
         platform_label="百度贴吧",
-        prompt_instruction="根据以下百度贴吧搜索结果，整合并给出「推荐前五」的商品或结论（与用户需求相关），字符长度每个商品限定在100字。",
+        prompt_instruction="根据以下百度贴吧搜索结果，整合并给出「推荐前五」的商品（与用户需求相关）。每个推荐必须包含商品名称和推荐原因（一句话），字符长度每个商品限定在100字。",
     )
 
 
@@ -222,7 +332,7 @@ def web_search_agent_weibo(state: AgentState) -> AgentState:
         state,
         platform_key="weibo",
         platform_label="微博",
-        prompt_instruction="根据以下微博搜索结果，整合并给出「推荐前五」的商品或结论（与用户需求相关），字符长度每个商品限定在100字。",
+        prompt_instruction="根据以下微博搜索结果，整合并给出「推荐前五」的商品（与用户需求相关）。每个推荐必须包含商品名称和推荐原因（一句话），字符长度每个商品限定在100字。",
     )
 
 
@@ -235,7 +345,7 @@ def web_search_agent_general(state: AgentState) -> AgentState:
         state,
         platform_key="general",
         platform_label="综合多平台",
-        prompt_instruction="根据以下多平台（知乎、小红书、百度贴吧、微博等）搜索结果，整合并给出「推荐前五」的商品或结论（与用户需求相关），字符长度每个商品限定在100字。",
+        prompt_instruction="根据以下多平台（知乎、小红书、百度贴吧、微博等）搜索结果，整合并给出「推荐前五」的商品（与用户需求相关）。每个推荐必须包含商品名称和推荐原因（一句话），字符长度每个商品限定在100字。",
     )
 
 
@@ -331,6 +441,20 @@ def _get_working_query(state: AgentState) -> str:
     return (state.get("processed_requirement") or "").strip() or state["query_text"]
 
 
+def _filter_content_with_body(results: list[dict], min_content_len: int = 200) -> list[dict]:
+    """
+    过滤掉只有摘要而没有主要内容的检索结果，避免上下文混乱。
+    仅保留 raw_content 存在且长度达标的条目。
+    """
+    filtered = []
+    for r in results:
+        raw = (r.get("raw_content") or "").strip()
+        snippet = (r.get("snippet") or "").strip()
+        if raw and (len(raw) >= min_content_len or len(raw) > len(snippet) + 80):
+            filtered.append(r)
+    return filtered if filtered else results  # 若全部被过滤则退回原列表，避免空输入
+
+
 def parse_query(state: AgentState) -> AgentState:
     """意图解析：使用 LLM 直接结构化抽取约束。"""
     query = _get_working_query(state)
@@ -345,7 +469,7 @@ def parse_query(state: AgentState) -> AgentState:
 
     prompt = CONSTRAINT_PARSER_PROMPT.format(history=history_text, query=query)
     try:
-        parsed = constraint_parser_llm.invoke(prompt)
+        parsed = _constraint_parser_llm().invoke(prompt)
         return {
             "extracted_constraints": {
                 "budget_min": parsed.budget_min,
@@ -399,29 +523,15 @@ def preference_recall_and_rewrite(state: AgentState) -> AgentState:
 
 
 def dual_path_retrieval(state: AgentState) -> AgentState:
-    """3. 双路检索：公开内容 + 公共评价数据"""
+    """
+    3. 双路检索：公开内容（多平台搜索结果）。
+    PDD 搜索延后至 pdd_mapping，基于 LLM 解析出的推荐商品进行映射，而非仅用用户关键词。
+    """
     query = state.get("rewritten_query") or state["query_text"]
-    constraints = state["extracted_constraints"]
-    keyword = constraints.get("keyword", "笔记本")
 
     # 若上游已执行过平台搜索节点，则复用其结果；否则走默认综合检索。
     content_results = state.get("content_search_results") or search_public_content(query)
-    review_results = []
-    try:
-        pdd_items = search_goods(keyword, page=1, page_size=20)
-        for item in pdd_items:
-            review_results.append({
-                "goods_name": item.get("goods_name"),
-                "name": item.get("goods_name"),
-                "title": item.get("goods_name"),
-                "price": item.get("min_group_price"),
-                "goods_id": item.get("goods_id"),
-                "goods_sign": item.get("goods_sign"),
-            })
-    except Exception:
-        pass
-
-    return {"content_search_results": content_results, "review_search_results": review_results}
+    return {"content_search_results": content_results, "review_search_results": []}
 
 
 # 向后兼容：workflow 里若仍使用 chatbot 名称，可映射到 controlbot
@@ -429,12 +539,39 @@ chatbot = controlbot
 
 
 def evidence_extraction(state: AgentState) -> AgentState:
-    """4. 证据抽取与候选商品生成、标准化、去重"""
+    """4. 证据抽取与候选商品生成、标准化、去重。优先注入 LLM 从平台摘要解析出的推荐商品。"""
     content = state.get("content_search_results", [])
     review = state.get("review_search_results", [])
+    llm_products = state.get("llm_recommended_products") or []
     evidence = extract_evidence(content, review)
+    # 将 LLM 解析的推荐商品作为高优先级候选注入（来源：llm_summary）
+    seen = {_norm_for_evidence(e["product_name"]) for e in evidence}
+    for name in llm_products:
+        if not name or not name.strip():
+            continue
+        norm = _norm_for_evidence(name.strip())
+        if norm not in seen:
+            seen.add(norm)
+            evidence.append({
+                "product_name": name.strip(),
+                "original_names": [name.strip()],
+                "pros": [],
+                "cons": [],
+                "scenarios": [],
+                "risks": [],
+                "sources": ["llm_summary"],
+            })
     normalized = deduplicate_candidates([{"product_name": e["product_name"], **e} for e in evidence])
     return {"extracted_evidence": evidence, "candidate_products": normalized, "normalized_candidates": normalized}
+
+
+def _norm_for_evidence(name: str) -> str:
+    """简易标准化用于去重"""
+    import re
+    s = (name or "").strip()
+    s = re.sub(r"\[[^\]]*\]", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:60] if len(s) > 60 else s
 
 
 def initial_screen_and_consistency(state: AgentState) -> AgentState:
@@ -463,7 +600,7 @@ def initial_screen_and_consistency(state: AgentState) -> AgentState:
         query,
         web_search_summary,
         keyword,
-        lambda p: model.invoke(p),
+        lambda p: _get_llm().invoke(p),
     )
     # 综合分 = 跨平台分(40%) + LLM质量分(60%)
     scored = []
@@ -524,7 +661,7 @@ def deep_search(state: AgentState) -> AgentState:
         deep_results,
         query,
         keyword,
-        lambda p: model.invoke(p),
+        lambda p: _get_llm().invoke(p),
         top_k=5,
     )
     # 将终排 Top5 置顶，其余保持原顺序
@@ -537,38 +674,81 @@ def deep_search(state: AgentState) -> AgentState:
 
 
 def pdd_mapping(state: AgentState) -> AgentState:
-    """7. 多多进宝映射"""
+    """
+    7. 多多进宝映射
+    策略：以 LLM 整理的 scored_candidates 为主推荐来源，按商品名在 PDD 中查找并补充购买链接；
+    若在 PDD 中找不到，仍保留该候选（无链接）；最后在末尾追加 PDD 中可搜到的近似商品。
+    """
     scored = state.get("scored_candidates", [])
     constraints = state["extracted_constraints"]
     keyword = constraints.get("keyword", "笔记本")
-    pdd_mapped = []
-    for c in scored[:10]:
-        if c.get("goods_sign"):
-            pdd_mapped.append({**c})
+    budget_max = constraints.get("budget_max")
+
+    # 若无 scored（极少见），用本地兜底作为主推荐
+    primary_source = scored[:10] if scored else _local_products_fallback(constraints)
+    if primary_source and not scored:
+        brand_pref = constraints.get("brand_preference") or []
+        for i, p in enumerate(primary_source):
+            p["total_score"] = p.get("total_score", 50 - i)
+            p["matched_constraints"] = p.get("matched_constraints", [])
+            p["violated_constraints"] = p.get("violated_constraints", [])
+            p["product_name"] = p.get("product_name", p.get("name", ""))
+        if brand_pref:
+            def _brand_score(x):
+                b = (x.get("brand") or "").strip()
+                for j, pref in enumerate(brand_pref):
+                    if pref and pref in b:
+                        return 1000 - j
+                return 0
+            primary_source.sort(key=lambda x: (-_brand_score(x), -x.get("total_score", 0)))
+
+    primary_candidates = []
+    matched_goods_signs: set[str] = set()
+
+    for c in primary_source:
+        name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
+        base = {
+            **c,
+            "name": c.get("product_name") or c.get("name") or c.get("normalized_name", name),
+            "is_approximate": False,
+        }
+        pdd_match = find_pdd_match_for_candidate(name, keyword) if name else None
+        if pdd_match and pdd_match.get("goods_sign"):
+            base["goods_sign"] = pdd_match["goods_sign"]
+            base["purchase_url"] = None
+            if not base.get("price") and pdd_match.get("price"):
+                base["price"] = pdd_match["price"]
+            if not base.get("product_id") and pdd_match.get("product_id"):
+                base["product_id"] = pdd_match["product_id"]
+            matched_goods_signs.add(pdd_match["goods_sign"])
+        elif c.get("goods_sign"):
+            base["goods_sign"] = c["goods_sign"]
+            base["purchase_url"] = None
+            matched_goods_signs.add(c["goods_sign"])
         else:
-            extra = map_candidates_to_pdd([c.get("product_name", c.get("name", ""))], keyword)
-            if extra:
-                pdd_mapped.append({
-                    **extra[0],
-                    "total_score": c.get("total_score", 0),
-                    "matched_constraints": c.get("matched_constraints", []),
-                    "violated_constraints": c.get("violated_constraints", []),
-                    "quality_reason": c.get("quality_reason", ""),
-                    "evidence_count": c.get("evidence_count", 0),
-                    "platform_count": c.get("platform_count", 0),
-                })
-    if not pdd_mapped:
-        pdd_mapped = map_candidates_to_pdd([], keyword)
-    if not pdd_mapped:
-        pdd_mapped = _local_products_fallback(constraints)
-    goods_signs = [p["goods_sign"] for p in pdd_mapped if p.get("goods_sign")]
-    if goods_signs:
-        links = get_promotion_links(goods_signs)
+            base["goods_sign"] = None
+            base["purchase_url"] = None
+        primary_candidates.append(base)
+
+    all_goods_signs = [p["goods_sign"] for p in primary_candidates if p.get("goods_sign")]
+    approximate = search_approximate_goods(
+        keyword, set(all_goods_signs), budget_max=budget_max, max_results=5
+    )
+    all_goods_signs.extend(p["goods_sign"] for p in approximate if p.get("goods_sign"))
+    all_goods_signs = [gs for gs in all_goods_signs if gs]
+
+    if all_goods_signs:
+        links = get_promotion_links(all_goods_signs)
         link_map = {l["goods_sign"]: l["url"] for l in links}
-        for p in pdd_mapped:
-            p["purchase_url"] = link_map.get(p.get("goods_sign", ""))
-    pdd_mapped.sort(key=lambda x: x.get("total_score", 0), reverse=True)
-    return {"pdd_mapped_products": pdd_mapped[:5], "has_exact_match": len(pdd_mapped) > 0}
+        for p in primary_candidates + approximate:
+            if p.get("goods_sign"):
+                p["purchase_url"] = link_map.get(p["goods_sign"], "")
+
+    pdd_mapped = primary_candidates + approximate
+    return {
+        "pdd_mapped_products": pdd_mapped,
+        "has_exact_match": len(primary_candidates) > 0,
+    }
 
 
 def fallback_similar(state: AgentState) -> AgentState:
@@ -586,14 +766,78 @@ def fallback_similar(state: AgentState) -> AgentState:
     return {"fallback_products": fallback}
 
 
+def _candidate_matches_llm_name(cand_name: str, llm_names: list[str]) -> int | None:
+    """若候选名与某 LLM 推荐名匹配，返回其下标；否则 None"""
+    cn = (cand_name or "").strip().lower()
+    for i, ln in enumerate(llm_names):
+        if not ln:
+            continue
+        ln_lower = ln.strip().lower()
+        if ln_lower in cn or cn in ln_lower:
+            return i
+    return None
+
+
+def _build_reason_for_candidate(c: dict, llm_reasons: list[dict], is_first: bool) -> str:
+    """为单个候选构建推荐原因文案"""
+    parts = []
+    qr = (c.get("quality_reason") or "").strip()
+    if qr and qr != "未评分":
+        parts.append(qr)
+    matched = c.get("matched_constraints", [])
+    for m in matched[:3]:
+        if m and m not in parts:
+            parts.append(m)
+    # 若有 LLM 解析的推荐原因，优先使用
+    name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
+    for r in (llm_reasons or []):
+        if r.get("name") and _candidate_matches_llm_name(name, [r["name"]]) is not None:
+            if r.get("reason") and r["reason"] not in parts:
+                parts.insert(0, r["reason"])
+            break
+    if c.get("evidence_count", 0) >= 2 and "多平台口碑支持" not in parts:
+        parts.append("多平台口碑支持")
+    return "；".join(parts) if parts else "综合评测推荐"
+
+
 def generate_final_output(state: AgentState) -> AgentState:
-    """9. 最终输出"""
+    """
+    9. 最终输出
+    推荐结果以 LLM 跨平台总结（web_search_summary）解析出的商品为准；
+    候选按 llm_recommended_products 顺序重排，取首位为最终推荐。
+    同时输出深度检索 Top5 全部结果（含推荐原因、多多进宝链接）。
+    """
     pdd = state.get("pdd_mapped_products", [])
     fallback = state.get("fallback_products", [])
-    scored = state.get("scored_candidates", [])
+    llm_order = state.get("llm_recommended_products") or []
+    llm_with_reasons = state.get("llm_recommended_with_reasons") or []
 
     candidates = pdd if pdd else fallback
-    final_rec = candidates[0] if candidates else None
+    primary = [c for c in candidates if not c.get("is_approximate")]
+    # 若有 LLM 推荐顺序，按该顺序重排 primary，确保首位来自 LLM 结论
+    if llm_order and primary:
+        def _sort_key(c):
+            name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
+            idx = _candidate_matches_llm_name(name, llm_order)
+            return (idx if idx is not None else 999, -c.get("total_score", 0))
+        primary = sorted(primary, key=_sort_key)
+
+    # 深度检索 Top5：取前 5 个主推荐（非近似），附带推荐原因和多多进宝链接
+    top5 = []
+    for i, c in enumerate(primary[:5]):
+        name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
+        reason = _build_reason_for_candidate(c, llm_with_reasons, is_first=(i == 0))
+        if c.get("is_fallback"):
+            reason = "（替代推荐：未找到同款，为您推荐相似商品）" + ("；" + reason if reason else "")
+        elif c.get("is_approximate"):
+            reason = "（多多进宝中未找到完全同款，为您推荐近似可选商品）" + ("；" + reason if reason else "")
+        top5.append({
+            "name": name,
+            "reason": reason,
+            "purchase_url": c.get("purchase_url") or None,
+        })
+
+    final_rec = primary[0] if primary else (candidates[0] if candidates else None)
     reasons = []
     risks = []
     links = []
@@ -607,11 +851,13 @@ def generate_final_output(state: AgentState) -> AgentState:
             reasons.append("多平台口碑支持")
         if final_rec.get("is_fallback"):
             reasons.insert(0, "（替代推荐：未找到同款，为您推荐相似商品）")
+        elif final_rec.get("is_approximate"):
+            reasons.insert(0, "（多多进宝中未找到完全同款，为您推荐近似可选商品）")
         risks = final_rec.get("violated_constraints", [])
         if final_rec.get("purchase_url"):
             links.append({"name": final_rec.get("name", ""), "url": final_rec["purchase_url"]})
-        for c in candidates[1:4]:
-            if c.get("purchase_url"):
+        for c in candidates[1:8]:
+            if c.get("purchase_url") and not any(l["url"] == c["purchase_url"] for l in links):
                 links.append({"name": c.get("name", ""), "url": c["purchase_url"]})
 
     return {
@@ -620,4 +866,5 @@ def generate_final_output(state: AgentState) -> AgentState:
         "risk_explanations": risks,
         "purchase_links": links,
         "candidates": candidates,
+        "top5_recommendations": top5,
     }

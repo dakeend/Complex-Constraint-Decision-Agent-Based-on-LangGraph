@@ -3,7 +3,8 @@ from langgraph.graph import END, START, StateGraph
 import os
 
 from .nodes import (
-    route_public_search_platform,
+    summarize_public_search,
+    extract_llm_recommendations,
     deep_search,
     dual_path_retrieval,
     evidence_extraction,
@@ -40,6 +41,8 @@ def build_graph():
     graph.add_node("search_weibo", web_search_agent_weibo)
     graph.add_node("search_general", web_search_agent_general)
     graph.add_node("dual_retrieval", dual_path_retrieval)
+    graph.add_node("summarize_search", summarize_public_search)
+    graph.add_node("extract_llm", extract_llm_recommendations)
     graph.add_node("evidence_extraction", evidence_extraction)
     graph.add_node("initial_screen", initial_screen_and_consistency)
     graph.add_node("deep_search", deep_search)
@@ -49,23 +52,20 @@ def build_graph():
 
     graph.add_edge(START, "parse_query")
     graph.add_edge("parse_query", "preference_recall")
-    graph.add_conditional_edges(
-        "preference_recall",
-        route_public_search_platform,
-        {
-            "zhihu": "search_zhihu",
-            "xiaohongshu": "search_xiaohongshu",
-            "tieba": "search_tieba",
-            "weibo": "search_weibo",
-            "general": "search_general",
-        },
-    )
+    # 并行触发所有平台搜索节点（每个平台节点内部用 LLM 并行压缩），最后汇总再进入后续检索/评价
+    graph.add_edge("preference_recall", "search_zhihu")
+    graph.add_edge("preference_recall", "search_xiaohongshu")
+    graph.add_edge("preference_recall", "search_tieba")
+    graph.add_edge("preference_recall", "search_weibo")
+    graph.add_edge("preference_recall", "search_general")
     graph.add_edge("search_zhihu", "dual_retrieval")
     graph.add_edge("search_xiaohongshu", "dual_retrieval")
     graph.add_edge("search_tieba", "dual_retrieval")
     graph.add_edge("search_weibo", "dual_retrieval")
     graph.add_edge("search_general", "dual_retrieval")
-    graph.add_edge("dual_retrieval", "evidence_extraction")
+    graph.add_edge("dual_retrieval", "summarize_search")
+    graph.add_edge("summarize_search", "extract_llm")
+    graph.add_edge("extract_llm", "evidence_extraction")
     graph.add_edge("evidence_extraction", "initial_screen")
     graph.add_conditional_edges(
         "initial_screen",

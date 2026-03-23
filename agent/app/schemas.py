@@ -59,6 +59,13 @@ class SessionInfo(BaseModel):
     created_at: str
 
 
+class Top5Recommendation(BaseModel):
+    """深度检索 Top5 单项：商品名、推荐原因、多多进宝链接"""
+    name: str = ""
+    reason: str = ""
+    purchase_url: str | None = None
+
+
 class AgentResponse(BaseModel):
     task_summary: str
     extracted_constraints: dict[str, Any]
@@ -69,3 +76,5 @@ class AgentResponse(BaseModel):
     recommendation_reason: list[str] = Field(default_factory=list)
     risk_explanations: list[str] = Field(default_factory=list)
     purchase_links: list[dict[str, str]] = Field(default_factory=list)
+    # 深度检索 Top5 全部结果（含推荐原因、多多进宝链接）
+    top5_recommendations: list[Top5Recommendation] = Field(default_factory=list)

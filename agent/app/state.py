@@ -1,5 +1,6 @@
 """Agent 状态定义，支持项目计划中的完整流程"""
-from typing import Any, TypedDict
+from typing import Any, TypedDict, Annotated
+import operator
 
 
 class AgentState(TypedDict, total=False):
@@ -22,8 +23,15 @@ class AgentState(TypedDict, total=False):
     rewritten_query: str
 
     # 3. 双路检索
-    content_search_results: list[dict[str, Any]]
+    # 并行搜索节点会同时写入该字段；用 reducer 做 list 累加合并，避免互相覆盖
+    content_search_results: Annotated[list[dict[str, Any]], operator.add]
+    # 每个平台节点对搜索结果做 LLM 压缩后的摘要（并行累加）
+    platform_summaries: Annotated[list[dict[str, Any]], operator.add]
     review_search_results: list[dict[str, Any]]
+    # LLM 从 web_search_summary 解析出的推荐商品列表（按推荐顺序），作为主推荐依据
+    llm_recommended_products: list[str]
+    # 推荐商品及推荐原因 [{name, reason}, ...]
+    llm_recommended_with_reasons: list[dict[str, Any]]
 
     # 4. 证据抽取与候选商品
     extracted_evidence: list[dict[str, Any]]
@@ -51,3 +59,5 @@ class AgentState(TypedDict, total=False):
     risk_explanations: list[str]
     purchase_links: list[dict[str, str]]
     candidates: list[dict[str, Any]]
+    # 深度检索 Top5 全部结果 [{name, reason, purchase_url}, ...]
+    top5_recommendations: list[dict[str, Any]]

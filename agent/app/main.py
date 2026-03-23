@@ -16,7 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .schemas import AgentResponse, CandidateProduct, ChatRequest, SessionInfo, UserQuery
+from .schemas import AgentResponse, CandidateProduct, ChatRequest, SessionInfo, Top5Recommendation, UserQuery
 from .workflow import build_graph
 
 app = FastAPI(title="商品选购辅助智能体")
@@ -38,9 +38,20 @@ def _format_response(r: AgentResponse) -> str:
         for q in r.clarifying_questions:
             parts.append(f"- {q}")
         parts.append("")
+    # 优先展示深度检索 Top5 全部结果
+    if r.top5_recommendations:
+        parts.append("## 深度检索推荐 Top5\n")
+        for i, rec in enumerate(r.top5_recommendations, 1):
+            parts.append(f"### {i}. {rec.name}\n")
+            if rec.reason:
+                parts.append(f"**推荐原因：** {rec.reason}\n")
+            if rec.purchase_url:
+                parts.append(f"[多多进宝购买链接]({rec.purchase_url})\n")
+            parts.append("")
     if r.final_recommendation:
         p = r.final_recommendation
-        parts.append(f"## 推荐商品：{p.name}\n")
+        parts.append("## 首选推荐\n")
+        parts.append(f"**{p.name}**\n")
         parts.append(f"**价格：** ¥{p.price}\n")
         if p.brand:
             parts.append(f"**品牌：** {p.brand}\n")
@@ -59,7 +70,7 @@ def _format_response(r: AgentResponse) -> str:
         parts.append("**候选商品：**\n")
         for i, p in enumerate(r.candidates[:5], 1):
             parts.append(f"{i}. {p.name} - ¥{p.price}")
-    else:
+    elif not r.top5_recommendations:
         parts.append("暂未找到符合条件的商品，请补充更多需求后重试。")
     return "\n".join(parts)
 
@@ -173,6 +184,8 @@ def chat(payload: ChatRequest):
     candidates = [_to_candidate(c) for c in result.get("candidates", [])]
     final_rec = result.get("final_recommendation")
     final_candidate = _to_candidate(final_rec) if final_rec else None
+    top5_raw = result.get("top5_recommendations", [])
+    top5 = [Top5Recommendation(name=t.get("name", ""), reason=t.get("reason", ""), purchase_url=t.get("purchase_url")) for t in top5_raw]
     resp = AgentResponse(
         task_summary=f"商品选购推荐：{payload.message}",
         extracted_constraints=result.get("extracted_constraints", {}),
@@ -183,6 +196,7 @@ def chat(payload: ChatRequest):
         recommendation_reason=result.get("recommendation_reason", []),
         risk_explanations=result.get("risk_explanations", []),
         purchase_links=result.get("purchase_links", []),
+        top5_recommendations=top5,
     )
     formatted = _format_response(resp)
     sess["messages"].append({"role": "assistant", "content": formatted})
@@ -205,6 +219,8 @@ def recommend(payload: UserQuery):
     final_rec = result.get("final_recommendation")
     final_candidate = _to_candidate(final_rec) if final_rec else None
 
+    top5_raw = result.get("top5_recommendations", [])
+    top5 = [Top5Recommendation(name=t.get("name", ""), reason=t.get("reason", ""), purchase_url=t.get("purchase_url")) for t in top5_raw]
     return AgentResponse(
         task_summary=f"商品选购推荐：{payload.query_text}",
         extracted_constraints=result.get("extracted_constraints", {}),
@@ -215,4 +231,5 @@ def recommend(payload: UserQuery):
         recommendation_reason=result.get("recommendation_reason", []),
         risk_explanations=result.get("risk_explanations", []),
         purchase_links=result.get("purchase_links", []),
+        top5_recommendations=top5,
     )

@@ -16,7 +16,8 @@ PLATFORM_WEIGHTS = {
     "weibo": 0.8,
     "general": 1.0,
     "mock": 0.5,
-    "pdd_review": 0.9,  # PDD 商品数据作为补充
+    "pdd_review": 0.9,
+    "llm_summary": 1.3,  # LLM 跨平台总结结论，优先采用
 }
 
 
@@ -70,6 +71,13 @@ def compute_cross_platform_scores(
     return result
 
 
+def _has_substantial_content(r: dict, min_len: int = 200) -> bool:
+    """判断检索结果是否有实质性正文（非仅摘要），避免上下文混乱"""
+    raw = (r.get("raw_content") or "").strip()
+    snippet = (r.get("snippet") or "").strip()
+    return bool(raw and (len(raw) >= min_len or len(raw) > len(snippet) + 80))
+
+
 def build_product_snippets(
     candidates: list[dict],
     content_results: list[dict],
@@ -77,8 +85,10 @@ def build_product_snippets(
 ) -> dict[str, list[dict]]:
     """
     为每个候选商品构建其相关的社交媒体片段（用于 LLM 打分）
+    仅使用有实质性正文的检索结果（排除只有摘要无内容的条目）。
     返回: {product_name: [{"platform": str, "title": str, "snippet": str}, ...]}
     """
+    content_results = [r for r in content_results if _has_substantial_content(r)]
     product_names: set[str] = set()
     product_aliases: dict[str, set[str]] = {}
     for c in candidates:
@@ -236,6 +246,8 @@ def deep_search_for_candidates(
             hits = search_fn(search_query, "general")
             items = []
             for h in hits[:5]:
+                if not _has_substantial_content(h):
+                    continue
                 items.append({
                     "title": h.get("title", ""),
                     "snippet": (h.get("snippet", "") or h.get("content", ""))[:600],

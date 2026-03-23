@@ -23,20 +23,54 @@ def _extract_products_from_text(text: str) -> list[str]:
 
 
 # 平台与 Tavily 域名对应（用于限定条件搜索）
+# 小红书：排除 pgy/e/ci 等商业化/帮助子域，优先主站笔记；贴吧用 tieba.baidu.com
 PLATFORM_DOMAINS = {
     "zhihu": ["zhihu.com"],
-    "xiaohongshu": ["xiaohongshu.com", "xiaohongshu.cn"],
+    "xiaohongshu": ["www.xiaohongshu.com", "xhslink.com", "xiaohongshu.com"],
     "tieba": ["tieba.baidu.com"],
     "weibo": ["weibo.com", "weibo.cn"],
     "general": [
         "zhihu.com",
+        "www.xiaohongshu.com",
+        "xhslink.com",
         "xiaohongshu.com",
-        "xiaohongshu.cn",
         "tieba.baidu.com",
         "weibo.com",
         "weibo.cn",
     ],
 }
+
+# 小红书需排除的子域（商业化/帮助中心，非用户种草笔记）
+XIAOHONGSHU_EXCLUDE_PREFIXES = ("pgy.xiaohongshu", "e.xiaohongshu", "ci.xiaohongshu", "ad.xiaohongshu", "partner.xiaohongshu")
+
+
+def _get_int_env(name: str, default: int) -> int:
+    v = (os.getenv(name) or "").strip()
+    if not v:
+        return default
+    try:
+        n = int(v)
+        return n if n > 0 else default
+    except Exception:
+        return default
+
+
+def _compact_snippet(text: str, max_chars: int) -> str:
+    """将原文压成适合 prompt 的片段（尽量保留更多原文，不是摘要）。"""
+    if not text:
+        return ""
+    s = re.sub(r"\s+", " ", text).strip()
+    if len(s) <= max_chars:
+        return s
+    # 尝试在句号/分号附近截断，避免硬切
+    cut = max(
+        s.rfind("。", 0, max_chars),
+        s.rfind("；", 0, max_chars),
+        s.rfind(";", 0, max_chars),
+    )
+    if cut >= max_chars * 0.6:
+        return s[: cut + 1]
+    return s[:max_chars]
 
 
 def _url_to_platform(url: str) -> str:
@@ -65,29 +99,51 @@ def _tavily_search(query: str, include_domains: list[str], max_results: int = 10
         return []
 
     client = TavilyClient(api_key=api_key)
-    resp = client.search(
-        query=query,
-        include_domains=include_domains,
-        max_results=max_results,
-        search_depth="basic",
-    )
+    # Tavily 的 content 往往是摘要级；尽量请求 raw_content 作为更长的 snippet 来源。
+    # 不同版本 SDK 参数可能不同，这里做兼容降级。
+    search_depth = (os.getenv("TAVILY_SEARCH_DEPTH") or "advanced").strip() or "advanced"
+    try:
+        resp = client.search(
+            query=query,
+            include_domains=include_domains,
+            max_results=max_results,
+            search_depth=search_depth,
+            include_raw_content=True,
+        )
+    except TypeError:
+        resp = client.search(
+            query=query,
+            include_domains=include_domains,
+            max_results=max_results,
+            search_depth=search_depth,
+        )
     if isinstance(resp, dict):
         results = resp.get("results", [])
     else:
         results = getattr(resp, "results", []) or []
+    snippet_max_chars = _get_int_env("SEARCH_SNIPPET_MAX_CHARS", 800)
     out = []
     for r in results:
         title = r.get("title", "")
-        content = r.get("content", "")
-        url = r.get("url", "")
+        content = r.get("content", "") or ""
+        raw_content = r.get("raw_content", "") or ""
+        url = (r.get("url", "") or "").lower()
         domain = _url_to_platform(url)
-        products = _extract_products_from_text(content or title)
+        # 小红书：排除商业化/帮助子域，这些不是用户种草笔记
+        if domain == "xiaohongshu" and any(p in url for p in XIAOHONGSHU_EXCLUDE_PREFIXES):
+            continue
+        # 优先 raw_content，为空时用 content（贴吧等平台常无 raw_content）
+        snippet_source = raw_content or content or title
+        snippet = _compact_snippet(snippet_source, snippet_max_chars)
+        raw_stored = raw_content or content  # 无 raw 时存 content，供下游用
+        products = _extract_products_from_text((content or raw_content) or title)
         out.append({
             "platform": domain,
             "title": title,
-            "snippet": content or title,
+            "snippet": snippet,
+            "raw_content": _compact_snippet(raw_stored, max(snippet_max_chars * 2, 1200)) if raw_stored else "",
             "products_mentioned": products,
-            "source": url,
+            "source": r.get("url", ""),
         })
     return out
 
@@ -101,10 +157,12 @@ def _mock_fallback(query: str, keyword: str) -> list[dict]:
     ]
     results = []
     for i, (title, snippet, products) in enumerate(mock_data[:5]):
+        raw = snippet * 3 if len(snippet) < 150 else snippet  # 模拟有正文，满足 min_content_len
         results.append({
             "platform": "mock",
             "title": title,
             "snippet": snippet,
+            "raw_content": raw,
             "products_mentioned": products,
             "source": f"mock_{i}",
         })
@@ -121,6 +179,9 @@ def search_public_content(query: str, platform: str = "general") -> list[dict]:
     domains = PLATFORM_DOMAINS.get(platform, PLATFORM_DOMAINS["general"])
     if not query.strip():
         query = "笔记本电脑 推荐"
+    # 小红书：加「种草 推荐」提高命中真实笔记的概率
+    if platform == "xiaohongshu" and "种草" not in query and "推荐" not in query:
+        query = f"{query} 种草 推荐"
 
     results = _tavily_search(query, include_domains=domains, max_results=10)
     if results:
