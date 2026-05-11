@@ -8,6 +8,13 @@
 
 from typing import Callable
 
+# 导入本地知识库检索服务
+try:
+    from .knowledge_retriever import retrieve_for_candidates, retrieve_product_review
+    KNOWLEDGE_RETRIEVER_AVAILABLE = True
+except ImportError:
+    KNOWLEDGE_RETRIEVER_AVAILABLE = False
+
 # 平台可信度权重（知乎偏理性长文、小红书偏种草、贴吧偏真实吐槽、微博偏碎片）
 PLATFORM_WEIGHTS = {
     "zhihu": 1.2,
@@ -158,6 +165,24 @@ def llm_quality_score(
     import json
 
     criteria = _get_evaluation_criteria(keyword)
+
+    # 新增：从本地知识库检索候选商品的评测信息
+    knowledge_reviews: dict[str, dict] = {}
+    if KNOWLEDGE_RETRIEVER_AVAILABLE:
+        knowledge_reviews = retrieve_for_candidates(candidates)
+
+    # 构建知识库摘要文本
+    knowledge_text = ""
+    if knowledge_reviews:
+        lines = []
+        for name, review in knowledge_reviews.items():
+            pros = ", ".join(review.get("pros", [])[:3])
+            cons = ", ".join(review.get("cons", [])[:3])
+            scenarios = ", ".join(review.get("suitable_scenarios", [])[:3])
+            summary = review.get("summary", "")
+            lines.append(f"- {name}: {summary}；优点: {pros}；缺点: {cons}；适用: {scenarios}")
+        knowledge_text = "\n\n商品评测知识库摘要：\n" + "\n".join(lines[:10])
+
     items_for_prompt = []
     for c in candidates:
         name = c.get("product_name", c.get("name", ""))
@@ -166,6 +191,13 @@ def llm_quality_score(
             f"[{s['platform']}] {s['title']}\n{s['snippet']}"
             for s in snippets[:5]
         ) or "（无相关社交内容）"
+
+        # 新增：如果有知识库信息，添加到 snippet_text
+        if name in knowledge_reviews:
+            kr = knowledge_reviews[name]
+            kb_text = f"\n[本地知识库] {kr.get('summary', '')}"
+            snippet_text += kb_text
+
         items_for_prompt.append({"name": name, "snippet_text": snippet_text})
 
     block = "\n\n---\n\n".join(
@@ -182,6 +214,7 @@ def llm_quality_score(
 {web_search_summary or '（无）'}
 
 {criteria}
+{knowledge_text}
 
 候选商品及社交内容：
 {block}

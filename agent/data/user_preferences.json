@@ -1,0 +1,9 @@
+{
+  "default": {
+    "budget_max": null,
+    "brand_preference": [],
+    "brand_avoid": [],
+    "usage_scenarios": [],
+    "price_range": ""
+  }
+}
