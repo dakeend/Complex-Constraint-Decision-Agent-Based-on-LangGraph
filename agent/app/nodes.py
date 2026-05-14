@@ -4,8 +4,11 @@ from pathlib import Path
 import os
 from typing import Optional
 
+import re
+
 from pydantic import BaseModel, Field
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from .state import AgentState
 from .services.content_search import search_public_content
 from .services.evidence import extract_evidence, deduplicate_candidates
@@ -29,7 +32,10 @@ from .services.quality_evaluation import (
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "products.json"
 os.environ.setdefault("TAVILY_API_KEY", os.getenv("TAVILY_API_KEY", ""))
+BAILIAN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
 _llm: ChatGroq | None = None
+_bailian_llm: ChatOpenAI | None = None
 
 
 def _get_llm() -> ChatGroq:
@@ -42,6 +48,83 @@ def _get_llm() -> ChatGroq:
         raise RuntimeError("缺少 GROQ_API_KEY 环境变量，无法调用 Groq LLM。")
     _llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=api_key)
     return _llm
+
+
+_bailian_json_llm: ChatOpenAI | None = None
+
+
+def _get_bailian_llm() -> ChatOpenAI:
+    """惰性初始化百炼 LLM（纯文本模式），作为 Groq 配额不足时的备选。"""
+    global _bailian_llm
+    if _bailian_llm is not None:
+        return _bailian_llm
+    api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("缺少 DASHSCOPE_API_KEY 环境变量，无法调用百炼 LLM。")
+    _bailian_llm = ChatOpenAI(
+        model="qwen3.5-flash",
+        api_key=api_key,
+        base_url=BAILIAN_BASE_URL,
+    )
+    return _bailian_llm
+
+
+def _get_bailian_json_llm() -> ChatOpenAI:
+    """惰性初始化百炼 LLM（JSON 模式），用于结构化输出。"""
+    global _bailian_json_llm
+    if _bailian_json_llm is not None:
+        return _bailian_json_llm
+    api_key = os.getenv("DASHSCOPE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("缺少 DASHSCOPE_API_KEY 环境变量，无法调用百炼 LLM。")
+    _bailian_json_llm = ChatOpenAI(
+        model="qwen3.5-flash",
+        api_key=api_key,
+        base_url=BAILIAN_BASE_URL,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+    return _bailian_json_llm
+
+
+def _get_llm_with_fallback():
+    """
+    返回带 fallback 的 LLM。优先百炼（稳定不限流），运行时失败自动切 Groq。
+    纯文本调用（非 structured_output）使用此函数。
+    """
+    try:
+        bailian = _get_bailian_llm()
+        return bailian.with_fallbacks([_get_llm()])
+    except RuntimeError:
+        return _get_llm()
+
+
+def _invoke_structured(prompt, output_model):
+    """
+    带结构化输出的 LLM 调用，自动 fallback。
+    优先用百炼（json_mode），失败时用 Groq structured_output。
+    """
+    schema = output_model.model_json_schema()
+    schema_text = json.dumps(schema, ensure_ascii=False)
+    # prompt 中必须包含 "JSON" 等词（百炼 json_mode 要求）
+    enhanced_prompt = f"{prompt}\n\n请严格按照以下 JSON Schema 回答，只输出 JSON：\n{schema_text}"
+
+    # 优先用百炼 JSON 模式
+    try:
+        bailian = _get_bailian_json_llm()
+        raw = bailian.invoke(enhanced_prompt)
+        text = (raw.content if hasattr(raw, 'content') else str(raw))
+        text = re.sub(r'<think[\s\S]*?</think\s*>', '', text).strip()
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```', '', text).strip()
+        match = re.search(r'\{[\s\S]*\}', text)
+        if match:
+            return output_model.model_validate_json(match.group())
+    except Exception:
+        pass
+
+    # fallback 到 Groq
+    groq = _get_llm()
+    return groq.with_structured_output(output_model).invoke(prompt)
 
 class RequirementCheckResult(BaseModel):
     """总控 Agent：需求充分性判断的结构化输出"""
@@ -88,20 +171,24 @@ class ParsedConstraintsResult(BaseModel):
     keyword: str = Field(default="笔记本", description="商品关键词/品类")
 
 
-def _orchestrator_llm():
-    return _get_llm().with_structured_output(RequirementCheckResult)
+def _orchestrator_llm_invoke(prompt):
+    return _invoke_structured(prompt, RequirementCheckResult)
 
 
-def _web_search_summary_llm():
-    return _get_llm().with_structured_output(WebSearchResult)
+def _web_search_summary_llm_invoke(prompt):
+    return _invoke_structured(prompt, WebSearchResult)
 
 
-def _constraint_parser_llm():
-    return _get_llm().with_structured_output(ParsedConstraintsResult)
+def _constraint_parser_llm_invoke(prompt):
+    return _invoke_structured(prompt, ParsedConstraintsResult)
 
 
-def _llm_recommendations_parser_llm():
-    return _get_llm().with_structured_output(LlmRecommendationsResult)
+def _llm_recommendations_parser_llm_invoke(prompt):
+    return _invoke_structured(prompt, LlmRecommendationsResult)
+
+
+def _followup_intent_llm_invoke(prompt):
+    return _invoke_structured(prompt, FollowupIntent)
 
 
 ORCHESTRATOR_PROMPT = """你是一个商品推荐流程的总控 Agent。
@@ -163,7 +250,7 @@ def controlbot(state: AgentState) -> AgentState:
     history_text = "\n".join(history_text_lines) or "（无历史对话，当前为第一轮）"
 
     prompt = ORCHESTRATOR_PROMPT.format(history=history_text, query=query)
-    result = _orchestrator_llm().invoke(prompt)
+    result = _orchestrator_llm_invoke(prompt)
 
     return {
         "info_sufficient": result.sufficient,
@@ -185,7 +272,13 @@ def _web_search_agent_impl(
     prompt_instruction: 填入 prompt 的整合说明，如「根据以下知乎搜索结果…」
     """
     query = _get_working_query(state)
-    raw_results = search_public_content(query, platform=platform_key)
+    try:
+        raw_results = search_public_content(query, platform=platform_key)
+    except Exception:
+        return {
+            "content_search_results": [],
+            "platform_summaries": [],
+        }
     search_list = raw_results[:10]
 
     # 过滤掉只有摘要没有主要内容的条目，避免上下文混乱
@@ -205,7 +298,13 @@ def _web_search_agent_impl(
     要求：每个推荐必须同时包含「商品名称」和「推荐原因」（一句话说明为何推荐，如配置、性价比、口碑等），格式示例：
     1. 机械革命极光X：同价位性价比高，RTX4060 满功耗释放，适合游戏
     2. 联想拯救者R7000P：一线品牌售后好，性能释放稳定"""
-    summary = _web_search_summary_llm().invoke(prompt)
+    try:
+        summary = _web_search_summary_llm_invoke(prompt)
+    except Exception:
+        return {
+            "content_search_results": search_list,
+            "platform_summaries": [],
+        }
 
     return {
         "content_search_results": search_list,
@@ -245,7 +344,7 @@ def summarize_public_search(state: AgentState) -> AgentState:
 4) 只输出结论，不要输出推理过程
 
 请填写 source_from 为「综合评价」，在 search_result 中写出最终结论。"""
-    final = _web_search_summary_llm().invoke(prompt)
+    final = _web_search_summary_llm_invoke(prompt)
     return {"web_search_summary": final.search_result, "web_search_source": final.source_from}
 
 
@@ -276,7 +375,7 @@ def extract_llm_recommendations(state: AgentState) -> AgentState:
 若无法识别具体型号，可输出品牌+品类（如机械革命游戏本）。
 若原文未给出原因，可根据内容推断简要原因。"""
     try:
-        parsed = _llm_recommendations_parser_llm().invoke(prompt)
+        parsed = _llm_recommendations_parser_llm_invoke(prompt)
         recs = (parsed.recommendations or [])[:5]
         products = [r.product_name for r in recs]
         with_reasons = [{"name": r.product_name, "reason": r.reason or ""} for r in recs]
@@ -469,18 +568,29 @@ def parse_query(state: AgentState) -> AgentState:
 
     prompt = CONSTRAINT_PARSER_PROMPT.format(history=history_text, query=query)
     try:
-        parsed = _constraint_parser_llm().invoke(prompt)
+        parsed = _constraint_parser_llm_invoke(prompt)
+        new_constraints = {
+            "budget_min": parsed.budget_min,
+            "budget_max": parsed.budget_max,
+            "usage_scenarios": parsed.usage_scenarios,
+            "brand_preference": parsed.brand_preference,
+            "brand_avoid": parsed.brand_avoid,
+            "need_portability": parsed.need_portability,
+            "need_dedicated_gpu": parsed.need_dedicated_gpu,
+            "keyword": parsed.keyword or "笔记本",
+        }
+        # 如果新抽取的 keyword 是默认值（笔记本）且 prev_state 有品类信息，则继承
+        prev_constraints = state.get("extracted_constraints") or {}
+        if new_constraints["keyword"] == "笔记本" and prev_constraints.get("keyword") and prev_constraints["keyword"] != "笔记本":
+            new_constraints["keyword"] = prev_constraints["keyword"]
+        # 如果新查询没有预算但之前有，继承之前的预算
+        if not new_constraints["budget_max"] and prev_constraints.get("budget_max"):
+            new_constraints["budget_max"] = prev_constraints["budget_max"]
+        if not new_constraints["budget_min"] and prev_constraints.get("budget_min"):
+            new_constraints["budget_min"] = prev_constraints["budget_min"]
+
         return {
-            "extracted_constraints": {
-                "budget_min": parsed.budget_min,
-                "budget_max": parsed.budget_max,
-                "usage_scenarios": parsed.usage_scenarios,
-                "brand_preference": parsed.brand_preference,
-                "brand_avoid": parsed.brand_avoid,
-                "need_portability": parsed.need_portability,
-                "need_dedicated_gpu": parsed.need_dedicated_gpu,
-                "keyword": parsed.keyword or "笔记本",
-            },
+            "extracted_constraints": new_constraints,
             "missing_info": [],
             "clarifying_questions": [],
             "info_sufficient": True,
@@ -600,7 +710,7 @@ def initial_screen_and_consistency(state: AgentState) -> AgentState:
         query,
         web_search_summary,
         keyword,
-        lambda p: _get_llm().invoke(p),
+        lambda p: _get_llm_with_fallback().invoke(p),
     )
     # 综合分 = 跨平台分(40%) + LLM质量分(60%)
     scored = []
@@ -661,7 +771,7 @@ def deep_search(state: AgentState) -> AgentState:
         deep_results,
         query,
         keyword,
-        lambda p: _get_llm().invoke(p),
+        lambda p: _get_llm_with_fallback().invoke(p),
         top_k=5,
     )
     # 将终排 Top5 置顶，其余保持原顺序
@@ -778,26 +888,299 @@ def _candidate_matches_llm_name(cand_name: str, llm_names: list[str]) -> int | N
     return None
 
 
-def _build_reason_for_candidate(c: dict, llm_reasons: list[dict], is_first: bool) -> str:
-    """为单个候选构建推荐原因文案"""
+def _build_reason_for_candidate(
+    c: dict,
+    llm_reasons: list[dict],
+    is_first: bool,
+    web_summary: str = "",
+) -> str:
+    """为单个候选构建推荐原因文案（至少80字）"""
     parts = []
-    qr = (c.get("quality_reason") or "").strip()
-    if qr and qr != "未评分":
-        parts.append(qr)
-    matched = c.get("matched_constraints", [])
-    for m in matched[:3]:
-        if m and m not in parts:
-            parts.append(m)
-    # 若有 LLM 解析的推荐原因，优先使用
     name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
+
+    # 1) 从 web_search_summary 中抽取与该商品相关的原文描述
+    if web_summary:
+        relevant_lines = []
+        name_parts = [p for p in name.replace("（", " ").replace("）", " ").split() if len(p) >= 2]
+        for line in web_summary.replace("。", "。\n").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            for np in name_parts:
+                if np in line:
+                    relevant_lines.append(line)
+                    break
+        if relevant_lines:
+            # 选取最相关的一句，截取前120字
+            best = min(relevant_lines, key=len)
+            if len(best) > 120:
+                best = best[:120] + "…"
+            parts.append(best)
+
+    # 2) LLM 解析的推荐原因
+    llm_reason_text = ""
     for r in (llm_reasons or []):
         if r.get("name") and _candidate_matches_llm_name(name, [r["name"]]) is not None:
-            if r.get("reason") and r["reason"] not in parts:
-                parts.insert(0, r["reason"])
+            llm_reason_text = r.get("reason", "")
             break
-    if c.get("evidence_count", 0) >= 2 and "多平台口碑支持" not in parts:
-        parts.append("多平台口碑支持")
-    return "；".join(parts) if parts else "综合评测推荐"
+
+    # 3) 商品核心配置特征
+    features = []
+    if c.get("cpu_model"):
+        features.append(f"搭载{c['cpu_model']}处理器")
+    if c.get("gpu_model"):
+        features.append(f"配备{c['gpu_model']}独立显卡")
+    if c.get("memory_gb"):
+        features.append(f"{c['memory_gb']}GB内存")
+    if c.get("storage_gb"):
+        features.append(f"{c['storage_gb']}GB固态硬盘")
+    if c.get("weight_kg") and c["weight_kg"] > 0:
+        features.append(f"机身重约{c['weight_kg']}kg")
+    if c.get("battery_hours") and c["battery_hours"] > 0:
+        features.append(f"续航约{c['battery_hours']}小时")
+    feature_text = "，".join(features) if features else ""
+
+    # 4) 质量评分与约束匹配
+    qr = (c.get("quality_reason") or "").strip()
+    matched = c.get("matched_constraints", [])
+    matched_text = "；".join(m for m in matched[:3] if m)
+
+    # 组装：LLM原因 + 配置特征 + 约束匹配 + 质量评语
+    all_parts = []
+    if llm_reason_text:
+        all_parts.append(llm_reason_text)
+    if feature_text:
+        all_parts.append(feature_text)
+    if matched_text and matched_text not in "；".join(all_parts):
+        all_parts.append(matched_text)
+    if qr and qr != "未评分" and qr not in "；".join(all_parts):
+        all_parts.append(qr)
+    if c.get("evidence_count", 0) >= 2 and "多平台口碑支持" not in "；".join(all_parts):
+        all_parts.append("多平台口碑支持")
+
+    # 若前面已有web摘要则合并
+    if parts:
+        reason = parts[0]
+        extra = "；".join(all_parts)
+        if extra:
+            reason = reason + "；" + extra
+    else:
+        reason = "；".join(all_parts) if all_parts else "综合评测推荐"
+
+    return reason if reason else "综合评测推荐"
+
+
+class FollowupIntent(BaseModel):
+    """追问意图分类结果"""
+    intent_type: str = Field(
+        description="意图类型：new_query（全新需求）/ clarify（澄清）/ compare（对比）/ adjust（调整筛选）/ expand（需要搜索扩展）"
+    )
+    target_products: list[str] = Field(
+        default_factory=list,
+        description="追问涉及的商品名称，如['机械革命极光X']；新查询时为空",
+    )
+    reasoning: str = Field(description="简要判断理由")
+
+
+
+FOLLOWUP_INTENT_PROMPT = """你是一个意图分类器。判断用户当前的输入是「全新推荐需求」还是对之前推荐结果的「追问」。
+
+用户最初的推荐需求：{original_query}
+
+之前的推荐结果：
+{top5_text}
+
+用户当前输入：
+{query}
+
+分类规则：
+- new_query：用户提出了全新的商品推荐需求（如"帮我推荐手机"、"我想买个耳机"），与之前的推荐品类完全不同
+- clarify：用户想了解已推荐商品的详细信息（如优缺点、参数、为什么推荐等）
+- compare：用户想对比已推荐的多款商品（如"第一款和第三款哪个好"）
+- adjust：用户想调整筛选条件、要更多推荐、或要求不同的排序（如"有更便宜的吗"、"5000以内的"、"不要联想的"、"除了这五个还有什么推荐"）
+- expand：用户想了解与推荐商品相关但需要额外搜索的信息（如"这个品牌怎么样"、"RTX4060性能如何"）
+
+注意：
+- "还有什么推荐"、"除了这些还有吗"属于 adjust 类型，不是 new_query
+- 只要用户还在讨论同一个品类，就是追问，不是 new_query
+- 只有当用户完全切换品类或需求时才属于 new_query
+
+只输出分类结果，不要补充解释。"""
+
+
+def intent_router(state: AgentState) -> AgentState:
+    """意图路由节点：判断是全新查询还是追问，以及追问类型"""
+    top5 = state.get("top5_recommendations") or []
+    candidates = state.get("candidates") or []
+
+    # 没有历史推荐结果，一定是新查询
+    if not top5 and not candidates:
+        return {"route_to": "new_query", "followup_intent": "new_query"}
+
+    # 构造原始需求描述
+    constraints = state.get("extracted_constraints") or {}
+    history = state.get("history", [])
+    # 从历史中提取第一条用户消息作为原始需求
+    original_query = ""
+    if history:
+        for m in history:
+            if m.get("role") == "user":
+                original_query = m.get("content", "")
+                break
+    if not original_query:
+        if constraints:
+            parts = []
+            if constraints.get("keyword"):
+                parts.append(f"品类：{constraints['keyword']}")
+            if constraints.get("budget_max"):
+                parts.append(f"预算：{constraints.get('budget_min', '')}-{constraints['budget_max']}元")
+            if constraints.get("usage_scenarios"):
+                parts.append(f"场景：{', '.join(constraints['usage_scenarios'])}")
+            original_query = "、".join(parts) if parts else "（未知）"
+        else:
+            original_query = "（未知）"
+
+    top5_text = "\n".join(
+        f"{i+1}. {t.get('name', '')}（{t.get('reason', '')}）"
+        for i, t in enumerate(top5[:5])
+    ) or "（无推荐结果）"
+
+    query = state["query_text"]
+    prompt = FOLLOWUP_INTENT_PROMPT.format(
+        original_query=original_query,
+        top5_text=top5_text,
+        query=query,
+    )
+    result = _followup_intent_llm_invoke(prompt)
+
+    intent = result.intent_type
+
+    if intent == "new_query":
+        route = "new_query"
+    elif intent == "expand":
+        route = "followup_search"
+    else:
+        route = "followup_simple"
+
+    return {"route_to": route, "followup_intent": intent}
+
+
+FOLLOWUP_HANDLER_PROMPT = """你是商品推荐助手，正在回答用户关于之前推荐结果的追问。
+
+之前的推荐结果（Top5）：
+{top5_text}
+
+全部候选商品（含价格等详情）：
+{candidates_text}
+
+之前的用户需求约束：
+{constraints_text}
+
+用户追问：{query}
+追问类型：{intent_type}
+
+回答要求：
+1. 基于已有的推荐结果和候选商品数据回答，不要编造信息
+2. 如果是澄清类追问（clarify），详细说明商品的优缺点和推荐理由
+3. 如果是对比类追问（compare），对比商品的各项指标给出明确建议
+4. 如果是调整类追问（adjust），严格从全部候选商品中筛选：
+   - "更多推荐"/"除了这些还有吗"：从 candidates 中挑选未出现在 top5 的商品，按评分排序推荐
+   - "更便宜的"/"预算调整"：按价格重新筛选 candidates
+   - "不要某品牌"：从 candidates 中排除该品牌后重新排序
+5. 回答要具体、有数据支撑，使用 Markdown 格式
+6. 如果调整类追问产生了新的推荐结果，请在末尾附上新的推荐列表，格式：
+   ---新推荐---
+   1. 商品名：推荐原因
+   2. 商品名：推荐原因
+   ...
+
+重要：adjust 类追问必须从已有 candidates 中筛选，不能编造新商品或调用搜索！"""
+
+
+def handle_followup(state: AgentState) -> AgentState:
+    """处理简单追问（澄清/对比/调整类），不触发搜索"""
+    top5 = state.get("top5_recommendations") or []
+    candidates = state.get("candidates") or state.get("pdd_mapped_products") or state.get("scored_candidates") or []
+    constraints = state.get("extracted_constraints") or {}
+    query = state["query_text"]
+    intent = state.get("followup_intent", "clarify")
+
+    top5_text = "\n".join(
+        f"{i+1}. {t.get('name', '')}：{t.get('reason', '')}"
+        for i, t in enumerate(top5[:5])
+    ) or "（无）"
+
+    top5_names = {t.get("name", "") for t in top5}
+    candidates_text = "\n".join(
+        f"- {c.get('name', c.get('product_name', ''))}：价格¥{c.get('price', '未知')}，"
+        f"品牌{c.get('brand', '未知')}，评分{c.get('total_score', '未知')}"
+        for c in candidates[:15]
+    ) or "（无）"
+
+    constraints_text = json.dumps(constraints, ensure_ascii=False, indent=2) if constraints else "（无）"
+
+    prompt = FOLLOWUP_HANDLER_PROMPT.format(
+        top5_text=top5_text,
+        candidates_text=candidates_text,
+        constraints_text=constraints_text,
+        query=query,
+        intent_type=intent,
+    )
+
+    answer = _get_llm_with_fallback().invoke(prompt).content
+    return {"followup_answer": answer}
+
+
+FOLLOWUP_SEARCH_PROMPT = """你是商品推荐助手，用户追问了一个需要额外搜索的问题。
+
+之前的推荐结果：
+{top5_text}
+
+用户追问：{query}
+
+以下是为你搜索到的相关信息：
+{search_results}
+
+请综合搜索结果和之前的推荐数据，回答用户的问题。要求：
+1. 回答要具体、有数据支撑
+2. 使用 Markdown 格式
+3. 如果搜索结果与之前的推荐有关联，可以交叉引用"""
+
+
+def handle_followup_search(state: AgentState) -> AgentState:
+    """处理需要搜索的扩展类追问，全平台搜索"""
+    query = state["query_text"]
+    top5 = state.get("top5_recommendations") or []
+
+    top5_text = "\n".join(
+        f"{i+1}. {t.get('name', '')}：{t.get('reason', '')}"
+        for i, t in enumerate(top5[:5])
+    ) or "（无）"
+
+    # 全平台搜索
+    platforms = ["zhihu", "xiaohongshu", "tieba", "weibo", "general"]
+    all_results = []
+    for platform in platforms:
+        try:
+            results = search_public_content(query, platform=platform)
+            all_results.extend(results[:3])
+        except Exception:
+            continue
+
+    # 汇总搜索结果
+    search_text = "\n\n".join(
+        f"【{r.get('platform', '未知')}】{r.get('title', '')}\n{r.get('snippet', '')}"
+        for r in all_results[:15]
+    ) or "（暂无搜索结果）"
+
+    prompt = FOLLOWUP_SEARCH_PROMPT.format(
+        top5_text=top5_text,
+        query=query,
+        search_results=search_text,
+    )
+
+    answer = _get_llm_with_fallback().invoke(prompt).content
+    return {"followup_answer": answer}
 
 
 def generate_final_output(state: AgentState) -> AgentState:
@@ -811,6 +1194,7 @@ def generate_final_output(state: AgentState) -> AgentState:
     fallback = state.get("fallback_products", [])
     llm_order = state.get("llm_recommended_products") or []
     llm_with_reasons = state.get("llm_recommended_with_reasons") or []
+    web_summary = state.get("web_search_summary", "") or ""
 
     candidates = pdd if pdd else fallback
     primary = [c for c in candidates if not c.get("is_approximate")]
@@ -826,7 +1210,7 @@ def generate_final_output(state: AgentState) -> AgentState:
     top5 = []
     for i, c in enumerate(primary[:5]):
         name = c.get("product_name") or c.get("name") or c.get("normalized_name", "")
-        reason = _build_reason_for_candidate(c, llm_with_reasons, is_first=(i == 0))
+        reason = _build_reason_for_candidate(c, llm_with_reasons, is_first=(i == 0), web_summary=web_summary)
         if c.get("is_fallback"):
             reason = "（替代推荐：未找到同款，为您推荐相似商品）" + ("；" + reason if reason else "")
         elif c.get("is_approximate"):

@@ -19,6 +19,11 @@ const gpuInput = document.getElementById('gpu-input');
 const extraInput = document.getElementById('extra-input');
 const sendBtn = document.getElementById('send-btn');
 const newChatBtn = document.getElementById('new-chat-btn');
+const followupArea = document.getElementById('followup-area');
+const followupInput = document.getElementById('followup-input');
+const followupBtn = document.getElementById('followup-btn');
+const exportBtn = document.getElementById('export-btn');
+let currentMessages = [];
 
 // 初始化
 async function init() {
@@ -28,6 +33,14 @@ async function init() {
     e.preventDefault();
     sendMessage();
   });
+  followupBtn.addEventListener('click', sendFollowup);
+  followupInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendFollowup();
+    }
+  });
+  exportBtn.addEventListener('click', exportChat);
 }
 
 // 加载会话列表
@@ -89,6 +102,14 @@ async function selectSession(id) {
     const data = await res.json();
     const messages = data.messages || [];
     renderMessages(messages);
+    // 根据消息数量切换输入区域
+    if (messages.length > 0) {
+      queryForm.style.display = 'none';
+      followupArea.style.display = 'flex';
+    } else {
+      queryForm.style.display = 'block';
+      followupArea.style.display = 'none';
+    }
   } catch (err) {
     console.error('加载会话失败', err);
   }
@@ -102,6 +123,8 @@ async function deleteSession(id) {
     if (currentSessionId === id) {
       currentSessionId = null;
       renderMessages([]);
+      queryForm.style.display = 'block';
+      followupArea.style.display = 'none';
     }
     renderSessions();
   } catch (err) {
@@ -140,6 +163,9 @@ async function sendMessage() {
     removeLoadingMessage();
     const formatted = data.formatted_response || formatResponse(data.response);
     appendMessage({ role: 'assistant', content: formatted, raw: data.response });
+    // 推荐结果出来后隐藏表单，显示追问输入框
+    queryForm.style.display = 'none';
+    followupArea.style.display = 'flex';
   } catch (err) {
     removeLoadingMessage();
     appendMessage({
@@ -247,6 +273,7 @@ function escapeHtml(s) {
 
 // 渲染消息列表
 function renderMessages(messages) {
+  currentMessages = messages.filter((m) => !m.loading);
   messagesContainer.innerHTML = '';
   emptyState.style.display = messages.length ? 'none' : 'flex';
   messages.forEach((m) => appendMessage(m, false));
@@ -254,6 +281,9 @@ function renderMessages(messages) {
 
 // 追加一条消息
 function appendMessage(msg, scroll = true) {
+  if (!msg.loading) {
+    currentMessages.push({ role: msg.role, content: msg.content });
+  }
   emptyState.style.display = 'none';
   const div = document.createElement('div');
   div.className = `message ${msg.role}`;
@@ -278,6 +308,73 @@ function setInputState(disabled) {
     el.disabled = disabled;
   });
   sendBtn.disabled = disabled;
+  followupBtn.disabled = disabled;
+  followupInput.disabled = disabled;
+}
+
+// 发送追问
+async function sendFollowup() {
+  const text = followupInput.value.trim();
+  if (!text || !currentSessionId) return;
+
+  followupInput.value = '';
+  appendMessage({ role: 'user', content: text });
+  setInputState(true);
+  appendMessage({ role: 'assistant', content: '', loading: true });
+
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        message: text,
+      }),
+    });
+    const data = await res.json();
+    if (data.session_id) currentSessionId = data.session_id;
+
+    removeLoadingMessage();
+    const formatted = data.formatted_response || formatResponse(data.response);
+    appendMessage({ role: 'assistant', content: formatted, raw: data.response });
+  } catch (err) {
+    removeLoadingMessage();
+    appendMessage({
+      role: 'assistant',
+      content: `请求失败：${err.message}`,
+    });
+  } finally {
+    setInputState(false);
+  }
+}
+
+// 导出当前对话为 Markdown
+function exportChat() {
+  if (!currentMessages || currentMessages.length === 0) {
+    alert('当前没有对话内容可以导出');
+    return;
+  }
+
+  const now = new Date();
+  const dateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+  let md = `# 商品选购助手对话记录\n\n`;
+  md += `> 导出时间：${now.toLocaleString('zh-CN')}\n\n---\n\n`;
+
+  for (const msg of currentMessages) {
+    const label = msg.role === 'user' ? '你' : '助手';
+    md += `### ${label}\n\n${msg.content}\n\n---\n\n`;
+  }
+
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `商品选购对话_${dateStr}.md`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 // 若没有会话则创建

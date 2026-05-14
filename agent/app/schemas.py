@@ -78,3 +78,5 @@ class AgentResponse(BaseModel):
     purchase_links: list[dict[str, str]] = Field(default_factory=list)
     # 深度检索 Top5 全部结果（含推荐原因、多多进宝链接）
     top5_recommendations: list[Top5Recommendation] = Field(default_factory=list)
+    # 追问回答（仅追问轮次有值）
+    followup_answer: str | None = None

@@ -13,6 +13,9 @@
         <span>+</span>
         <span>新对话</span>
       </button>
+      <button class="btn-export" id="export-btn" title="导出当前对话为 Markdown">
+        <span>导出</span>
+      </button>
     </div>
     <div class="sidebar-body" id="sidebar-body"></div>
   </aside>
@@ -74,6 +77,11 @@
           <button class="btn-send" id="send-btn" type="submit">提交需求</button>
         </div>
       </form>
+      <!-- 追问输入区域，推荐结果后显示 -->
+      <div class="followup-area" id="followup-area" style="display:none;">
+        <input id="followup-input" type="text" placeholder="输入追问，例如：第一款有什么优缺点？有更便宜的吗？">
+        <button class="btn-send" id="followup-btn">发送追问</button>
+      </div>
     </div>
   </main>
   <script src="/static/chat.js"></script>

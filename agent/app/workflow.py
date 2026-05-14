@@ -11,6 +11,9 @@ from .nodes import (
     fallback_similar,
     generate_final_output,
     initial_screen_and_consistency,
+    intent_router,
+    handle_followup,
+    handle_followup_search,
     parse_query,
     preference_recall_and_rewrite,
     pdd_mapping,
@@ -33,6 +36,12 @@ def should_deep_search(state: AgentState) -> str:
 def build_graph():
     graph = StateGraph(AgentState)
 
+    # 追问路由与处理节点
+    graph.add_node("intent_router", intent_router)
+    graph.add_node("followup_handler", handle_followup)
+    graph.add_node("followup_search_handler", handle_followup_search)
+
+    # 原有节点
     graph.add_node("parse_query", parse_query)
     graph.add_node("preference_recall", preference_recall_and_rewrite)
     graph.add_node("search_zhihu", web_search_agent_zhihu)
@@ -50,9 +59,24 @@ def build_graph():
     graph.add_node("fallback", fallback_similar)
     graph.add_node("generate_output", generate_final_output)
 
-    graph.add_edge(START, "parse_query")
+    # 入口：意图路由
+    graph.add_edge(START, "intent_router")
+    graph.add_conditional_edges(
+        "intent_router",
+        lambda s: s.get("route_to", "new_query"),
+        {
+            "new_query": "parse_query",
+            "followup_simple": "followup_handler",
+            "followup_search": "followup_search_handler",
+        },
+    )
+
+    # 追问分支 → END
+    graph.add_edge("followup_handler", END)
+    graph.add_edge("followup_search_handler", END)
+
+    # 原有推荐流程
     graph.add_edge("parse_query", "preference_recall")
-    # 并行触发所有平台搜索节点（每个平台节点内部用 LLM 并行压缩），最后汇总再进入后续检索/评价
     graph.add_edge("preference_recall", "search_zhihu")
     graph.add_edge("preference_recall", "search_xiaohongshu")
     graph.add_edge("preference_recall", "search_tieba")

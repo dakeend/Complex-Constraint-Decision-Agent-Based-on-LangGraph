@@ -61,3 +61,8 @@ class AgentState(TypedDict, total=False):
     candidates: list[dict[str, Any]]
     # 深度检索 Top5 全部结果 [{name, reason, purchase_url}, ...]
     top5_recommendations: list[dict[str, Any]]
+
+    # 10. 追问相关
+    route_to: str  # 路由目标：new_query / followup_simple / followup_search
+    followup_intent: str  # 意图类型：clarify / compare / adjust / expand / new_query
+    followup_answer: str  # 追问回答文本

@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .schemas import AgentResponse, CandidateProduct, ChatRequest, SessionInfo, Top5Recommendation, UserQuery
+from .services.session_store import save_session, load_session, list_sessions as db_list_sessions, delete_session as db_delete_session
 from .workflow import build_graph
 
 app = FastAPI(title="商品选购辅助智能体")
@@ -25,9 +26,6 @@ graph = build_graph()
 # 静态文件
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# 会话存储（内存，重启后清空）
-_sessions: dict[str, dict] = {}
 
 
 def _format_response(r: AgentResponse) -> str:
@@ -40,11 +38,10 @@ def _format_response(r: AgentResponse) -> str:
         parts.append("")
     # 优先展示深度检索 Top5 全部结果
     if r.top5_recommendations:
-        parts.append("## 深度检索推荐 Top5\n")
         for i, rec in enumerate(r.top5_recommendations, 1):
-            parts.append(f"### {i}. {rec.name}\n")
+            parts.append(f"{i}. {rec.name}\n")
             if rec.reason:
-                parts.append(f"**推荐原因：** {rec.reason}\n")
+                parts.append(f"推荐原因：{rec.reason}\n")
             if rec.purchase_url:
                 parts.append(f"[多多进宝购买链接]({rec.purchase_url})\n")
             parts.append("")
@@ -52,7 +49,8 @@ def _format_response(r: AgentResponse) -> str:
         p = r.final_recommendation
         parts.append("## 首选推荐\n")
         parts.append(f"**{p.name}**\n")
-        parts.append(f"**价格：** ¥{p.price}\n")
+        if p.price and p.price > 0:
+            parts.append(f"**价格：** ¥{p.price}\n")
         if p.brand:
             parts.append(f"**品牌：** {p.brand}\n")
         if p.cpu_model or p.gpu_model:
@@ -108,12 +106,8 @@ def health():
 
 
 @app.get("/api/sessions")
-def list_sessions():
-    items = sorted(
-        _sessions.values(),
-        key=lambda x: x["created_at"],
-        reverse=True,
-    )
+def list_sessions_api():
+    items = db_list_sessions()
     return {
         "sessions": [
             SessionInfo(id=s["id"], title=s["title"], created_at=s["created_at"])
@@ -125,84 +119,114 @@ def list_sessions():
 @app.post("/api/sessions")
 def create_session():
     sid = str(uuid.uuid4())
-    _sessions[sid] = {
-        "id": sid,
-        "title": "新对话",
-        "created_at": datetime.now().isoformat(),
-        "messages": [],
-    }
-    return {"session": _sessions[sid]}
+    now = datetime.now().isoformat()
+    save_session(sid, "新对话", now, [], {})
+    return {"session": {"id": sid, "title": "新对话", "created_at": now}}
 
 
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str):
-    if session_id not in _sessions:
+    s = load_session(session_id)
+    if not s:
         return {"messages": []}
-    s = _sessions[session_id]
-    return {"messages": s["messages"]}
+    return {"messages": s.get("messages", [])}
 
 
 @app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str):
-    _sessions.pop(session_id, None)
+def delete_session_api(session_id: str):
+    db_delete_session(session_id)
     return {"ok": True}
 
 
 @app.post("/api/chat")
 def chat(payload: ChatRequest):
     sid = payload.session_id
-    if not sid or sid not in _sessions:
+    now = datetime.now().isoformat()
+
+    # 从 SQLite 加载会话
+    sess = load_session(sid) if sid else None
+    if not sess:
         sid = str(uuid.uuid4())
-        _sessions[sid] = {
-            "id": sid,
-            "title": payload.message[:30] + ("…" if len(payload.message) > 30 else ""),
-            "created_at": datetime.now().isoformat(),
-            "messages": [],
-        }
-    sess = _sessions[sid]
+        title = payload.message[:30] + ("…" if len(payload.message) > 30 else "")
+        sess = {"id": sid, "title": title, "created_at": now, "messages": [], "last_state": {}}
+    else:
+        if len(sess.get("messages", [])) == 0:
+            sess["title"] = payload.message[:30] + ("…" if len(payload.message) > 30 else "")
+
+    messages = sess.get("messages", [])
+
     # 追加当前用户消息
-    sess["messages"].append({"role": "user", "content": payload.message})
-    if len(sess["messages"]) == 1:
-        sess["title"] = payload.message[:30] + ("…" if len(payload.message) > 30 else "")
+    messages.append({"role": "user", "content": payload.message})
 
-    # 构造对话历史，包含本轮之前的若干条消息
-    history = sess["messages"][:-1]
-    # 仅保留最近若干条，避免上下文过长
-    history = history[-10:]
+    # 构造对话历史
+    history = messages[:-1][-10:]
 
-    # 为了让「补充回答」也能生效，将最近两轮用户输入拼在一起作为 query_text
-    user_utts = [m["content"] for m in history if m.get("role") == "user"]
-    user_utts.append(payload.message)
-    merged_query = "。".join(user_utts[-2:]) if len(user_utts) >= 2 else payload.message
+    # 获取上一次推荐的 state，供追问节点使用
+    prev_state = sess.get("last_state", {})
 
     state_in = {
-        "query_text": merged_query,
+        **prev_state,
+        "query_text": payload.message,
         "user_id": None,
         "history": history,
     }
-    result = graph.invoke(state_in)
-    candidates = [_to_candidate(c) for c in result.get("candidates", [])]
-    final_rec = result.get("final_recommendation")
-    final_candidate = _to_candidate(final_rec) if final_rec else None
-    top5_raw = result.get("top5_recommendations", [])
-    top5 = [Top5Recommendation(name=t.get("name", ""), reason=t.get("reason", ""), purchase_url=t.get("purchase_url")) for t in top5_raw]
-    resp = AgentResponse(
-        task_summary=f"商品选购推荐：{payload.message}",
-        extracted_constraints=result.get("extracted_constraints", {}),
-        missing_info=result.get("missing_info", []),
-        clarifying_questions=result.get("clarifying_questions", []),
-        candidates=candidates,
-        final_recommendation=final_candidate,
-        recommendation_reason=result.get("recommendation_reason", []),
-        risk_explanations=result.get("risk_explanations", []),
-        purchase_links=result.get("purchase_links", []),
-        top5_recommendations=top5,
+    try:
+        result = graph.invoke(state_in)
+    except Exception as exc:
+        err_msg = f"推荐流程执行失败，请稍后重试。错误信息：{exc}"
+        if "rate_limit" in str(exc).lower() or "429" in str(exc):
+            err_msg = "API 调用频率已达上限，请等待几分钟后再试。"
+        messages.append({"role": "assistant", "content": err_msg})
+        save_session(
+            sid,
+            sess.get("title", "新对话"),
+            sess.get("created_at", now),
+            messages,
+            {},
+        )
+        return {
+            "session_id": sid,
+            "formatted_response": err_msg,
+        }
+
+    # 判断是否为追问轮次
+    followup_answer = result.get("followup_answer", "")
+    if followup_answer:
+        formatted = followup_answer
+    else:
+        candidates = [_to_candidate(c) for c in result.get("candidates", [])]
+        final_rec = result.get("final_recommendation")
+        final_candidate = _to_candidate(final_rec) if final_rec else None
+        top5_raw = result.get("top5_recommendations", [])
+        top5 = [Top5Recommendation(name=t.get("name", ""), reason=t.get("reason", ""), purchase_url=t.get("purchase_url")) for t in top5_raw]
+        resp = AgentResponse(
+            task_summary=f"商品选购推荐：{payload.message}",
+            extracted_constraints=result.get("extracted_constraints", {}),
+            missing_info=result.get("missing_info", []),
+            clarifying_questions=result.get("clarifying_questions", []),
+            candidates=candidates,
+            final_recommendation=final_candidate,
+            recommendation_reason=result.get("recommendation_reason", []),
+            risk_explanations=result.get("risk_explanations", []),
+            purchase_links=result.get("purchase_links", []),
+            top5_recommendations=top5,
+            followup_answer=None,
+        )
+        formatted = _format_response(resp)
+
+    messages.append({"role": "assistant", "content": formatted})
+
+    # 持久化会话和推荐状态
+    save_session(
+        sid,
+        sess.get("title", "新对话"),
+        sess.get("created_at", now),
+        messages,
+        result,
     )
-    formatted = _format_response(resp)
-    sess["messages"].append({"role": "assistant", "content": formatted})
+
     return {
         "session_id": sid,
-        "response": resp.model_dump(),
         "formatted_response": formatted,
     }
 
